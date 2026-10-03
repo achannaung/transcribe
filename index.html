@@ -204,6 +204,7 @@
     <div class="analyze-row">
       <button class="btn btn-primary" id="transcribeBtn" disabled>🎙️ Transcribe Audio</button>
     </div>
+    <p class="hint-text" style="text-align:center">6 မိနစ်ထက်ရှည်သော audio များကို အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်ပေးပါမည် ⚡</p>
     <div class="status-banner error" id="errBanner"></div>
     <div class="status-banner info" id="infoBanner"></div>
   </div>
@@ -253,6 +254,7 @@ const $ = id => document.getElementById(id);
 let parsed = null;
 let results = null;
 let currentAudioFile = null;
+let currentDuration = null;
 
 function init() {
   const dz = $('dropzone'), fi = $('fileInput');
@@ -285,6 +287,13 @@ const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing 
 
 function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.test(f.name); }
 
+// Parallel chunking: audio longer than CHUNK_MIN_DUR is split into CHUNK_SEC
+// pieces (16kHz mono WAV) and transcribed concurrently, then merged.
+const CHUNK_SEC = 300;
+const CHUNK_CONCURRENCY = 3;
+const CHUNK_MIN_DUR = 360;
+const CHUNK_MAX_DUR = 3600;
+
 function fmtBytes(b) {
   if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
   if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
@@ -296,6 +305,7 @@ function loadFile(file) {
   parsed = null;
   results = null;
   currentAudioFile = null;
+  currentDuration = null;
   $('results').classList.remove('show');
   $('transcribeBtn').disabled = true;
   $('stFormat').textContent = '—';
@@ -317,7 +327,10 @@ async function loadAudioFile(file) {
   $('stFormat').textContent = ((file.type || 'audio/mpeg').split('/')[1] || 'audio').toUpperCase();
   $('transcribeBtn').disabled = false;
   getAudioDuration(file).then(d => {
-    if (d) $('stDur').textContent = d >= 3600 ? (d / 3600).toFixed(1) + ' hr' : Math.round(d / 60) + ' min';
+    if (d) {
+      currentDuration = d;
+      $('stDur').textContent = d >= 3600 ? (d / 3600).toFixed(1) + ' hr' : Math.round(d / 60) + ' min';
+    }
   });
 }
 
@@ -354,10 +367,19 @@ async function transcribeFlow() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Transcribing…';
   try {
-    let text = await transcribeGemini(currentAudioFile, key);
-    parsed = parseTranscript(text);
-    if (!parsed.segments.length) throw Object.assign(new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။'), { payload: text.slice(0, 800) });
+    const useChunked = currentDuration && currentDuration > CHUNK_MIN_DUR && currentDuration <= CHUNK_MAX_DUR;
+    if (useChunked) {
+      showInfo('⚡ Audio ရှည်လို့ အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်နေသည်…');
+      const merged = await transcribeChunked(currentAudioFile, key);
+      if (!merged.length) throw new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။');
+      parsed = { format: 'Chunked', segments: merged };
+    } else {
+      const text = await transcribeGemini(currentAudioFile, key);
+      parsed = parseTranscript(text);
+      if (!parsed.segments.length) throw Object.assign(new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။'), { payload: text.slice(0, 800) });
+    }
     parsed.segments = paragraphize(parsed.segments);
+    $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
     showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။');
   } catch (err) {
@@ -370,25 +392,10 @@ async function transcribeFlow() {
   }
 }
 
-async function transcribeGemini(file, key) {
+async function generateTranscript(parts, key) {
   const models = PROVIDERS.gemini.models;
-  const mime = file.type || 'audio/mpeg';
-  let uri = null, name = null;
-  if (file.size > 14 * 1024 * 1024) {
-    showInfo('⬆️ Uploading to Gemini Files API…');
-    const up = await geminiResumableUpload(file, mime, key);
-    uri = up.uri;
-    name = up.name;
-    showInfo('⏳ File processing စောင့်နေသည် (large file)…');
-    await waitForGeminiFile(name, key);
-  }
-  const parts = [{ text: TRANSCRIBE_PROMPT }];
-  if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
-  else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
-
   let lastErr = null;
   for (const model of models) {
-    showInfo('🧠 Transcribing with <b>' + model + '</b> — audio ရှည်လျှင် မိနစ်အနည်းငယ်ကြာနိုင်ပါသည်…');
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 600000);
     try {
@@ -407,13 +414,123 @@ async function transcribeGemini(file, key) {
       const m = /API error (\d+)/.exec(err.message || '');
       const status = m ? parseInt(m[1], 10) : 0;
       console.error('Transcribe model failed:', model, err.message);
-      if (err.name === 'AbortError' || status === 404 || status === 429 || status >= 500) continue;
+      if (err.name === 'AbortError' || status === 404 || status === 429 || status >= 500) {
+        showInfo('⚠️ <b>' + model + '</b> အဆင်မပြေလို့ နောက် model နဲ့ ထပ်စမ်းနေသည်…');
+        continue;
+      }
       throw err;
     } finally {
       clearTimeout(t);
     }
   }
   throw lastErr || new Error('All models failed.');
+}
+
+async function transcribeGemini(file, key) {
+  const model = PROVIDERS.gemini.models[0];
+  const mime = file.type || 'audio/mpeg';
+  let uri = null, name = null;
+  if (file.size > 14 * 1024 * 1024) {
+    showInfo('⬆️ Uploading to Gemini Files API…');
+    const up = await geminiResumableUpload(file, mime, key);
+    uri = up.uri;
+    name = up.name;
+    showInfo('⏳ File processing စောင့်နေသည် (large file)…');
+    await waitForGeminiFile(name, key);
+  } else {
+    showInfo('🧠 Transcribing with <b>' + model + '</b> (inline)…');
+  }
+  const parts = [{ text: TRANSCRIBE_PROMPT }];
+  if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
+  else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
+  return generateTranscript(parts, key);
+}
+
+async function decodeToMono16k(file) {
+  const ab = await file.arrayBuffer();
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let buf = null;
+  try {
+    const ctx = new AC({ sampleRate: 16000 });
+    try { buf = await ctx.decodeAudioData(ab.slice(0)); }
+    finally { if (ctx.close) ctx.close(); }
+  } catch (e) { buf = null; }
+  if (!buf) {
+    const ctx = new AC();
+    try { buf = await ctx.decodeAudioData(ab.slice(0)); }
+    finally { if (ctx.close) ctx.close(); }
+  }
+  if (buf.sampleRate !== 16000) {
+    const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(buf.duration * 16000)), 16000);
+    const src = off.createBufferSource();
+    src.buffer = buf;
+    src.connect(off.destination);
+    src.start(0);
+    buf = await off.startRendering();
+  }
+  const ch0 = buf.getChannelData(0);
+  if (buf.numberOfChannels === 1) return ch0;
+  const out = new Float32Array(ch0.length);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const ch = buf.getChannelData(c);
+    for (let i = 0; i < out.length; i++) out[i] += ch[i] / buf.numberOfChannels;
+  }
+  return out;
+}
+
+function encodeWavChunk(mono, startSec, lenSec) {
+  const sr = 16000;
+  const start = Math.floor(startSec * sr);
+  const len = Math.min(Math.floor(lenSec * sr), mono.length - start);
+  const dataLen = Math.max(0, len);
+  const buf = new ArrayBuffer(44 + dataLen * 2);
+  const v = new DataView(buf);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, 'RIFF'); v.setUint32(4, 36 + dataLen * 2, true); wstr(8, 'WAVE');
+  wstr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wstr(36, 'data'); v.setUint32(40, dataLen * 2, true);
+  for (let i = 0; i < dataLen; i++) {
+    const s = Math.max(-1, Math.min(1, mono[start + i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+async function transcribeChunked(file, key) {
+  showInfo('🔊 Audio ကို decode လုပ်နေသည်…');
+  const mono = await decodeToMono16k(file);
+  const totalSec = mono.length / 16000;
+  const n = Math.max(1, Math.ceil(totalSec / CHUNK_SEC));
+  const chunkTexts = new Array(n);
+  let done = 0;
+  const queue = Array.from({ length: n }, (_, i) => i);
+  const workers = Array.from({ length: Math.min(CHUNK_CONCURRENCY, n) }, async () => {
+    while (queue.length) {
+      const i = queue.shift();
+      const start = i * CHUNK_SEC;
+      const len = Math.min(CHUNK_SEC, totalSec - start);
+      const wavB64 = encodeWavChunk(mono, start, len);
+      showInfo('🧠 Transcribing chunk <b>' + (i + 1) + '/' + n + '</b>… (' + done + '/' + n + ' ပြီးပြီ)');
+      const parts = [{ text: TRANSCRIBE_PROMPT }, { inlineData: { mimeType: 'audio/wav', data: wavB64 } }];
+      chunkTexts[i] = await generateTranscript(parts, key);
+      done++;
+      showInfo('🧠 Transcribing… <b>' + done + '/' + n + '</b> chunks ပြီးပြီ');
+    }
+  });
+  await Promise.all(workers);
+  const merged = [];
+  for (let i = 0; i < n; i++) {
+    const segs = parseTranscript(chunkTexts[i]).segments;
+    const off = i * CHUNK_SEC;
+    for (const s of segs) merged.push({ start: secToTime(timeToSec(s.start) + off), text: s.text });
+  }
+  return merged;
 }
 
 async function geminiResumableUpload(file, mime, key) {
