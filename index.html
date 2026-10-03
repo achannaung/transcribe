@@ -247,7 +247,7 @@ Return ONLY the timestamped transcript text, one segment per line:
 Do NOT include any titles, headers, speaker labels, commentary, or markdown formatting.`;
 
 const PROVIDERS = {
-  gemini:     { label: 'Google Gemini',   models: ['gemini-3.6-flash', 'gemini-3.6-pro', 'gemini-2.5-flash'] }
+  gemini:     { label: 'Google Gemini',   models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.6-pro', 'gemini-2.5-flash'] }
 };
 
 const $ = id => document.getElementById(id);
@@ -392,8 +392,35 @@ async function transcribeFlow() {
   }
 }
 
+let discoveredModels = null;
+let discoveredAt = 0;
+
+function modelVersionRank(n) {
+  const m = /(\d+)\.(\d+)/.exec(n);
+  return m ? parseInt(m[1], 10) * 100 + parseInt(m[2], 10) : 0;
+}
+
+// Ask the API which models actually exist for this key (cached 1h),
+// so retired model names don't break the app.
+async function discoverModels(key) {
+  const now = Date.now();
+  if (discoveredModels && now - discoveredAt < 3600000) return discoveredModels;
+  try {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?key=' + encodeURIComponent(key) + '&pageSize=100');
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ms = (j.models || [])
+      .map(m => String(m.name || '').replace(/^models\//, ''))
+      .filter(n => /flash/i.test(n) && !/tts|image|embed|aqa/i.test(n));
+    ms.sort((a, b) => modelVersionRank(b) - modelVersionRank(a));
+    if (ms.length) { discoveredModels = ms; discoveredAt = now; return ms; }
+  } catch (e) { console.error('model discovery failed:', e); }
+  return null;
+}
+
 async function generateTranscript(parts, key) {
-  const models = PROVIDERS.gemini.models;
+  const discovered = await discoverModels(key);
+  const models = [...new Set([...(discovered || []), ...PROVIDERS.gemini.models])];
   let lastErr = null;
   for (const model of models) {
     const ctrl = new AbortController();
