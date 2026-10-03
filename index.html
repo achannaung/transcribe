@@ -294,6 +294,35 @@ const CHUNK_CONCURRENCY = 3;
 const CHUNK_MIN_DUR = 360;
 const CHUNK_MAX_DUR = 3600;
 
+// Tell the model the true audio length so it can't invent timestamps
+// beyond the end of the audio.
+function buildPrompt(durationSec) {
+  let p = TRANSCRIBE_PROMPT;
+  if (durationSec && durationSec > 0) {
+    const total = secToTime(Math.round(durationSec));
+    p += "\n\nCRITICAL: The audio is exactly " + total + " long. Every timestamp MUST be between [00:00:00] and [" + total + "]. The final segment must start before " + total + ". Never invent timestamps beyond the audio length.";
+  }
+  return p;
+}
+
+// If the model hallucinated timestamps far beyond the real audio length,
+// scale them back proportionally. Only touches clearly-broken outputs.
+function clampTimestamps(segments, durationSec) {
+  if (!segments.length || !durationSec || durationSec <= 0) return { segments, scaled: false };
+  const secs = segments.map(s => timeToSec(s.start)).filter(Number.isFinite);
+  if (!secs.length) return { segments, scaled: false };
+  const maxTs = Math.max.apply(null, secs);
+  if (!(maxTs > durationSec * 1.15)) return { segments, scaled: false };
+  const k = durationSec / maxTs;
+  return {
+    segments: segments.map(s => {
+      const t = timeToSec(s.start);
+      return Number.isFinite(t) ? { start: secToTime(t * k), text: s.text } : s;
+    }),
+    scaled: true
+  };
+}
+
 function fmtBytes(b) {
   if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
   if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
@@ -368,20 +397,26 @@ async function transcribeFlow() {
   btn.innerHTML = '<span class="spinner"></span> Transcribing…';
   try {
     const useChunked = currentDuration && currentDuration > CHUNK_MIN_DUR && currentDuration <= CHUNK_MAX_DUR;
+    let tsScaled = false;
     if (useChunked) {
       showInfo('⚡ Audio ရှည်လို့ အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်နေသည်…');
-      const merged = await transcribeChunked(currentAudioFile, key);
-      if (!merged.length) throw new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။');
-      parsed = { format: 'Chunked', segments: merged };
+      const chk = await transcribeChunked(currentAudioFile, key);
+      if (!chk.segments.length) throw new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။');
+      parsed = { format: 'Chunked', segments: chk.segments };
+      tsScaled = chk.scaled;
     } else {
       const text = await transcribeGemini(currentAudioFile, key);
       parsed = parseTranscript(text);
       if (!parsed.segments.length) throw Object.assign(new Error('Transcription မှ timestamp မရပါ — retry လုပ်ပါ။'), { payload: text.slice(0, 800) });
+      const cl = clampTimestamps(parsed.segments, currentDuration);
+      parsed.segments = cl.segments;
+      tsScaled = cl.scaled;
     }
     parsed.segments = paragraphize(parsed.segments);
     $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
-    showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။');
+    showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။' +
+      (tsScaled ? '<br>⚠️ Timestamp များ audio အရှည်နှင့် ကိုက်ညီအောင် အချိုးကျ ပြင်ဆင်ပေးထားပါသည်။' : ''));
   } catch (err) {
     let msg = err.name === 'AbortError' ? '❌ Transcription timeout' : '❌ ' + err.message;
     if (err.payload) msg += '<br><br><span style="opacity:.8;font-size:12px">' + escapeHtml(String(err.payload)).slice(0, 600) + '</span>';
@@ -467,7 +502,7 @@ async function transcribeGemini(file, key) {
   } else {
     showInfo('🧠 Transcribing with <b>' + model + '</b> (inline)…');
   }
-  const parts = [{ text: TRANSCRIBE_PROMPT }];
+  const parts = [{ text: buildPrompt(currentDuration) }];
   if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
   else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
   return generateTranscript(parts, key);
@@ -544,7 +579,7 @@ async function transcribeChunked(file, key) {
       const len = Math.min(CHUNK_SEC, totalSec - start);
       const wavB64 = encodeWavChunk(mono, start, len);
       showInfo('🧠 Transcribing chunk <b>' + (i + 1) + '/' + n + '</b>… (' + done + '/' + n + ' ပြီးပြီ)');
-      const parts = [{ text: TRANSCRIBE_PROMPT }, { inlineData: { mimeType: 'audio/wav', data: wavB64 } }];
+      const parts = [{ text: buildPrompt(len) }, { inlineData: { mimeType: 'audio/wav', data: wavB64 } }];
       chunkTexts[i] = await generateTranscript(parts, key);
       done++;
       showInfo('🧠 Transcribing… <b>' + done + '/' + n + '</b> chunks ပြီးပြီ');
@@ -552,12 +587,17 @@ async function transcribeChunked(file, key) {
   });
   await Promise.all(workers);
   const merged = [];
+  let scaled = false;
   for (let i = 0; i < n; i++) {
-    const segs = parseTranscript(chunkTexts[i]).segments;
+    const chunkLen = Math.min(CHUNK_SEC, totalSec - i * CHUNK_SEC);
+    let segs = parseTranscript(chunkTexts[i]).segments;
+    const cl = clampTimestamps(segs, chunkLen);
+    segs = cl.segments;
+    if (cl.scaled) scaled = true;
     const off = i * CHUNK_SEC;
     for (const s of segs) merged.push({ start: secToTime(timeToSec(s.start) + off), text: s.text });
   }
-  return merged;
+  return { segments: merged, scaled };
 }
 
 async function geminiResumableUpload(file, mime, key) {
