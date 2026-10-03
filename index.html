@@ -371,12 +371,10 @@ async function transcribeFlow() {
 }
 
 async function transcribeGemini(file, key) {
-  const model = PROVIDERS.gemini.models[0];
+  const models = PROVIDERS.gemini.models;
   const mime = file.type || 'audio/mpeg';
   let uri = null, name = null;
-  if (file.size <= 14 * 1024 * 1024) {
-    showInfo('🧠 Transcribing with <b>' + model + '</b> (inline)…');
-  } else {
+  if (file.size > 14 * 1024 * 1024) {
     showInfo('⬆️ Uploading to Gemini Files API…');
     const up = await geminiResumableUpload(file, mime, key);
     uri = up.uri;
@@ -384,26 +382,38 @@ async function transcribeGemini(file, key) {
     showInfo('⏳ File processing စောင့်နေသည် (large file)…');
     await waitForGeminiFile(name, key);
   }
-  showInfo('🧠 Transcribing with <b>' + model + '</b> — audio ရှည်လျှင် မိနစ်အနည်းငယ်ကြာနိုင်ပါသည်…');
   const parts = [{ text: TRANSCRIBE_PROMPT }];
   if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
   else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 600000);
-  try {
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0, maxOutputTokens: 65535 } }),
-      signal: ctrl.signal
-    });
-    const j = await handleHttp(r);
-    const cand = j.candidates && j.candidates[0];
-    if (!cand || !cand.content) throw Object.assign(new Error('Gemini returned no content.'), { payload: j });
-    return cand.content.parts.map(p => p.text || '').join('');
-  } finally {
-    clearTimeout(t);
+
+  let lastErr = null;
+  for (const model of models) {
+    showInfo('🧠 Transcribing with <b>' + model + '</b> — audio ရှည်လျှင် မိနစ်အနည်းငယ်ကြာနိုင်ပါသည်…');
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 600000);
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0, maxOutputTokens: 65535 } }),
+        signal: ctrl.signal
+      });
+      const j = await handleHttp(r);
+      const cand = j.candidates && j.candidates[0];
+      if (!cand || !cand.content) throw Object.assign(new Error('Gemini returned no content.'), { payload: j });
+      return cand.content.parts.map(p => p.text || '').join('');
+    } catch (err) {
+      lastErr = err;
+      const m = /API error (\d+)/.exec(err.message || '');
+      const status = m ? parseInt(m[1], 10) : 0;
+      console.error('Transcribe model failed:', model, err.message);
+      if (err.name === 'AbortError' || status === 404 || status === 429 || status >= 500) continue;
+      throw err;
+    } finally {
+      clearTimeout(t);
+    }
   }
+  throw lastErr || new Error('All models failed.');
 }
 
 async function geminiResumableUpload(file, mime, key) {
