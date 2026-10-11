@@ -435,7 +435,12 @@ async function transcribeFlow() {
       (tsScaled ? '<br>⚠️ Timestamp များ audio အရှည်နှင့် ကိုက်ညီအောင် အချိုးကျ ပြင်ဆင်ပေးထားပါသည်။' : ''));
   } catch (err) {
     let msg = err.name === 'AbortError' ? '❌ Transcription timeout' : '❌ ' + err.message;
-    if (err.payload) msg += '<br><br><span style="opacity:.8;font-size:12px">' + escapeHtml(String(err.payload)).slice(0, 600) + '</span>';
+    if (err.payload) {
+      let detail = '';
+      try { detail = typeof err.payload === 'string' ? err.payload : JSON.stringify(err.payload); }
+      catch (e) { detail = String(err.payload); }
+      msg += '<br><br><span style="opacity:.8;font-size:12px">' + escapeHtml(detail).slice(0, 800) + '</span>';
+    }
     showError(msg);
   } finally {
     btn.disabled = false;
@@ -485,8 +490,22 @@ async function generateTranscript(parts, key, timeoutMs) {
       });
       const j = await handleHttp(r);
       const cand = j.candidates && j.candidates[0];
-      if (!cand || !cand.content) throw Object.assign(new Error('Gemini returned no content.'), { payload: j });
-      return cand.content.parts.map(p => p.text || '').join('');
+      const cparts = cand && cand.content && cand.content.parts;
+      const outText = cparts ? cparts.map(p => p.text || '').join('') : '';
+      if (outText.trim()) return outText;
+      // No usable text — diagnose why before deciding to retry or fail.
+      const blockReason = j.promptFeedback && j.promptFeedback.blockReason;
+      const finishReason = cand && cand.finishReason;
+      const noContentErr = Object.assign(
+        new Error('Gemini returned no content.' +
+          (blockReason ? ' Block reason: ' + blockReason + '.' : '') +
+          (finishReason ? ' Finish reason: ' + finishReason + '.' : '')),
+        { payload: j });
+      console.error('Transcribe model returned no content:', model, noContentErr.message);
+      if (blockReason) throw noContentErr; // safety block — other models will block it too
+      showInfo('⚠️ <b>' + model + '</b> က content ပြန်မပေးလို့ နောက် model နဲ့ ထပ်စမ်းနေသည်…');
+      lastErr = noContentErr;
+      continue;
     } catch (err) {
       lastErr = err;
       const m = /API error (\d+)/.exec(err.message || '');
