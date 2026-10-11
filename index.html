@@ -204,7 +204,7 @@
     <div class="analyze-row">
       <button class="btn btn-primary" id="transcribeBtn" disabled>🎙️ Transcribe Audio</button>
     </div>
-    <p class="hint-text" style="text-align:center">6 မိနစ်ထက် ရှည်သော audio (1.5 နာရီအထိ) များကို အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်ပေးပါမည် ⚡ · timestamp တစ်မိနစ်တစ်ခု ထွက်ပါမယ်</p>
+    <p class="hint-text" style="text-align:center">ရှည်သော audio (1.5 နာရီအထိ) များကို အမြန်ဆုံး နည်းလမ်းဖြင့် transcribe လုပ်ပေးပါမည် ⚡ · timestamp တစ်မိနစ်တစ်ခု ထွက်ပါမယ်</p>
     <div class="status-banner error" id="errBanner"></div>
     <div class="status-banner info" id="infoBanner"></div>
   </div>
@@ -287,12 +287,14 @@ const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing 
 
 function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.test(f.name); }
 
-// Parallel chunking: audio longer than CHUNK_MIN_DUR is split into CHUNK_SEC
-// pieces (16kHz mono WAV) and transcribed concurrently, then merged.
+// Parallel chunking: audio between CHUNK_MIN_DUR and CHUNK_MAX_DUR is split
+// into CHUNK_SEC pieces (16kHz mono WAV) and transcribed concurrently, then
+// merged. Longer files skip chunking and use the fast single-file Files API
+// path instead (no slow in-browser decode).
 const CHUNK_SEC = 300;
 const CHUNK_CONCURRENCY = 3;
 const CHUNK_MIN_DUR = 360;
-const CHUNK_MAX_DUR = 5400; // 90 min — longer files skip chunking and use the single-file Files API path
+const CHUNK_MAX_DUR = 3600;
 
 // Tell the model the true audio length so it can't invent timestamps
 // beyond the end of the audio.
@@ -467,13 +469,13 @@ async function discoverModels(key) {
   return null;
 }
 
-async function generateTranscript(parts, key) {
+async function generateTranscript(parts, key, timeoutMs) {
   const discovered = await discoverModels(key);
   const models = [...new Set([...(discovered || []), ...PROVIDERS.gemini.models])];
   let lastErr = null;
   for (const model of models) {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 600000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs || 600000);
     try {
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
         method: 'POST',
@@ -519,7 +521,15 @@ async function transcribeGemini(file, key) {
   const parts = [{ text: buildPrompt(currentDuration) }];
   if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
   else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
-  return generateTranscript(parts, key);
+  return generateTranscript(parts, key, singleTimeoutMs());
+}
+
+// Long single-file transcriptions need more than the default 10-minute
+// request timeout: scale it with the audio length (~2x realtime, clamped to
+// 10–30 minutes) so 90-minute files aren't cut off mid-run.
+function singleTimeoutMs() {
+  const d = currentDuration || 0;
+  return Math.min(1800000, Math.max(600000, d * 2000));
 }
 
 async function decodeToMono16k(file) {
