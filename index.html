@@ -168,7 +168,7 @@
   <header>
     <div class="logo-badge">🎙️ Burmese Audio Transcriber</div>
     <h1>မြန်မာ <span>Audio Transcription</span> စနစ်</h1>
-    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac — 1.5 နာရီအထိ ရပါတယ်) ကို upload လုပ်ပါ — AI က <b>1 မိနစ်တစ်ခု timestamp</b> ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
+    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
   </header>
 
   <div class="panel">
@@ -204,7 +204,7 @@
     <div class="analyze-row">
       <button class="btn btn-primary" id="transcribeBtn" disabled>🎙️ Transcribe Audio</button>
     </div>
-    <p class="hint-text" style="text-align:center">ရှည်သော audio (1.5 နာရီအထိ) များကို အမြန်ဆုံး နည်းလမ်းဖြင့် transcribe လုပ်ပေးပါမည် ⚡ · timestamp တစ်မိနစ်တစ်ခု ထွက်ပါမယ်</p>
+    <p class="hint-text" style="text-align:center">6 မိနစ်ထက်ရှည်သော audio များကို အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်ပေးပါမည် ⚡</p>
     <div class="status-banner error" id="errBanner"></div>
     <div class="status-banner info" id="infoBanner"></div>
   </div>
@@ -283,14 +283,12 @@ function saveSettings() {
 }
 
 const AUDIO_RE = /\.(mp3|wav|m4a|aac|ogg|oga|opus|webm|flac)$/i;
-const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (Burmese speech) into Burmese text. Output ONLY timestamped lines, one per segment, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text for that segment. Use the actual time in the audio where each segment begins, e.g. [00:00:45].\n\nTIMESTAMP GRANULARITY (CRITICAL): Emit a timestamp AT LEAST every 60 seconds of audio — roughly one line per minute, e.g. [00:00:00], [00:01:00], [00:02:00], ... Even if a sentence is still continuing, start a new line with a fresh timestamp at each minute mark. You may use shorter segments too, but NEVER let more than about 60 seconds pass without a timestamp line.\n\nDo NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the audio.';
+const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (a Burmese Dhamma talk) into Burmese text. Output ONLY timestamped lines, one per natural paragraph or segment, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text for that segment. Use the actual time in the audio where each segment begins, e.g. [00:00:45]. Do NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the talk.';
 
 function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.test(f.name); }
 
-// Parallel chunking: audio between CHUNK_MIN_DUR and CHUNK_MAX_DUR is split
-// into CHUNK_SEC pieces (16kHz mono WAV) and transcribed concurrently, then
-// merged. Longer files skip chunking and use the fast single-file Files API
-// path instead (no slow in-browser decode).
+// Parallel chunking: audio longer than CHUNK_MIN_DUR is split into CHUNK_SEC
+// pieces (16kHz mono WAV) and transcribed concurrently, then merged.
 const CHUNK_SEC = 300;
 const CHUNK_CONCURRENCY = 3;
 const CHUNK_MIN_DUR = 360;
@@ -378,26 +376,12 @@ function getAudioDuration(file) {
   });
 }
 
-// Group segments into fixed 1-minute buckets, so the transcript always has
-// roughly one timestamp line per minute of audio even when the model emits
-// shorter fragments or sparser timestamps. Bucket boundaries are
-// minute-aligned (00:00, 01:00, 02:00, ...).
-function bucketize(segs, bucketSec) {
-  bucketSec = bucketSec || 60;
+function paragraphize(segs) {
   const out = [];
-  const buckets = new Map();
+  let cur = null;
   for (const s of segs) {
-    const t = timeToSec(s.start);
-    if (!Number.isFinite(t)) continue;
-    const b = Math.floor(t / bucketSec);
-    let cur = buckets.get(b);
-    if (!cur) {
-      cur = { start: secToTime(b * bucketSec), text: s.text };
-      buckets.set(b, cur);
-      out.push(cur);
-    } else {
-      cur.text += ' ' + s.text;
-    }
+    if (cur && timeToSec(s.start) - timeToSec(cur.start) < 40) cur.text += ' ' + s.text;
+    else { cur = { start: s.start, text: s.text }; out.push(cur); }
   }
   return out;
 }
@@ -428,19 +412,14 @@ async function transcribeFlow() {
       parsed.segments = cl.segments;
       tsScaled = cl.scaled;
     }
-    parsed.segments = bucketize(parsed.segments, 60);
+    parsed.segments = paragraphize(parsed.segments);
     $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
     showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။' +
       (tsScaled ? '<br>⚠️ Timestamp များ audio အရှည်နှင့် ကိုက်ညီအောင် အချိုးကျ ပြင်ဆင်ပေးထားပါသည်။' : ''));
   } catch (err) {
     let msg = err.name === 'AbortError' ? '❌ Transcription timeout' : '❌ ' + err.message;
-    if (err.payload) {
-      let detail = '';
-      try { detail = typeof err.payload === 'string' ? err.payload : JSON.stringify(err.payload); }
-      catch (e) { detail = String(err.payload); }
-      msg += '<br><br><span style="opacity:.8;font-size:12px">' + escapeHtml(detail).slice(0, 800) + '</span>';
-    }
+    if (err.payload) msg += '<br><br><span style="opacity:.8;font-size:12px">' + escapeHtml(String(err.payload)).slice(0, 600) + '</span>';
     showError(msg);
   } finally {
     btn.disabled = false;
@@ -474,13 +453,13 @@ async function discoverModels(key) {
   return null;
 }
 
-async function generateTranscript(parts, key, timeoutMs) {
+async function generateTranscript(parts, key) {
   const discovered = await discoverModels(key);
   const models = [...new Set([...(discovered || []), ...PROVIDERS.gemini.models])];
   let lastErr = null;
   for (const model of models) {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs || 600000);
+    const t = setTimeout(() => ctrl.abort(), 600000);
     try {
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
         method: 'POST',
@@ -490,22 +469,8 @@ async function generateTranscript(parts, key, timeoutMs) {
       });
       const j = await handleHttp(r);
       const cand = j.candidates && j.candidates[0];
-      const cparts = cand && cand.content && cand.content.parts;
-      const outText = cparts ? cparts.map(p => p.text || '').join('') : '';
-      if (outText.trim()) return outText;
-      // No usable text — diagnose why before deciding to retry or fail.
-      const blockReason = j.promptFeedback && j.promptFeedback.blockReason;
-      const finishReason = cand && cand.finishReason;
-      const noContentErr = Object.assign(
-        new Error('Gemini returned no content.' +
-          (blockReason ? ' Block reason: ' + blockReason + '.' : '') +
-          (finishReason ? ' Finish reason: ' + finishReason + '.' : '')),
-        { payload: j });
-      console.error('Transcribe model returned no content:', model, noContentErr.message);
-      if (blockReason) throw noContentErr; // safety block — other models will block it too
-      showInfo('⚠️ <b>' + model + '</b> က content ပြန်မပေးလို့ နောက် model နဲ့ ထပ်စမ်းနေသည်…');
-      lastErr = noContentErr;
-      continue;
+      if (!cand || !cand.content) throw Object.assign(new Error('Gemini returned no content.'), { payload: j });
+      return cand.content.parts.map(p => p.text || '').join('');
     } catch (err) {
       lastErr = err;
       const m = /API error (\d+)/.exec(err.message || '');
@@ -540,15 +505,7 @@ async function transcribeGemini(file, key) {
   const parts = [{ text: buildPrompt(currentDuration) }];
   if (uri) parts.push({ fileData: { mimeType: mime, fileUri: uri } });
   else parts.push({ inlineData: { mimeType: mime, data: await fileToBase64(file) } });
-  return generateTranscript(parts, key, singleTimeoutMs());
-}
-
-// Long single-file transcriptions need more than the default 10-minute
-// request timeout: scale it with the audio length (~2x realtime, clamped to
-// 10–30 minutes) so 90-minute files aren't cut off mid-run.
-function singleTimeoutMs() {
-  const d = currentDuration || 0;
-  return Math.min(1800000, Math.max(600000, d * 2000));
+  return generateTranscript(parts, key);
 }
 
 async function decodeToMono16k(file) {
