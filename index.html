@@ -168,7 +168,7 @@
   <header>
     <div class="logo-badge">🎙️ Burmese Audio Transcriber</div>
     <h1>မြန်မာ <span>Audio Transcription</span> စနစ်</h1>
-    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
+    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac — 1.5 နာရီအထိ ရပါတယ်) ကို upload လုပ်ပါ — AI က <b>1 မိနစ်တစ်ခု timestamp</b> ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
   </header>
 
   <div class="panel">
@@ -204,7 +204,7 @@
     <div class="analyze-row">
       <button class="btn btn-primary" id="transcribeBtn" disabled>🎙️ Transcribe Audio</button>
     </div>
-    <p class="hint-text" style="text-align:center">6 မိနစ်ထက်ရှည်သော audio များကို အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်ပေးပါမည် ⚡</p>
+    <p class="hint-text" style="text-align:center">6 မိနစ်ထက် ရှည်သော audio (1.5 နာရီအထိ) များကို အပိုင်းခွဲ၍ တစ်ပြိုင်နက် transcribe လုပ်ပေးပါမည် ⚡ · timestamp တစ်မိနစ်တစ်ခု ထွက်ပါမယ်</p>
     <div class="status-banner error" id="errBanner"></div>
     <div class="status-banner info" id="infoBanner"></div>
   </div>
@@ -283,7 +283,7 @@ function saveSettings() {
 }
 
 const AUDIO_RE = /\.(mp3|wav|m4a|aac|ogg|oga|opus|webm|flac)$/i;
-const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (a Burmese Dhamma talk) into Burmese text. Output ONLY timestamped lines, one per natural paragraph or segment, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text for that segment. Use the actual time in the audio where each segment begins, e.g. [00:00:45]. Do NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the talk.';
+const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (Burmese speech) into Burmese text. Output ONLY timestamped lines, one per segment, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text for that segment. Use the actual time in the audio where each segment begins, e.g. [00:00:45].\n\nTIMESTAMP GRANULARITY (CRITICAL): Emit a timestamp AT LEAST every 60 seconds of audio — roughly one line per minute, e.g. [00:00:00], [00:01:00], [00:02:00], ... Even if a sentence is still continuing, start a new line with a fresh timestamp at each minute mark. You may use shorter segments too, but NEVER let more than about 60 seconds pass without a timestamp line.\n\nDo NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the audio.';
 
 function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.test(f.name); }
 
@@ -292,7 +292,7 @@ function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.tes
 const CHUNK_SEC = 300;
 const CHUNK_CONCURRENCY = 3;
 const CHUNK_MIN_DUR = 360;
-const CHUNK_MAX_DUR = 3600;
+const CHUNK_MAX_DUR = 5400; // 90 min — longer files skip chunking and use the single-file Files API path
 
 // Tell the model the true audio length so it can't invent timestamps
 // beyond the end of the audio.
@@ -376,12 +376,26 @@ function getAudioDuration(file) {
   });
 }
 
-function paragraphize(segs) {
+// Group segments into fixed 1-minute buckets, so the transcript always has
+// roughly one timestamp line per minute of audio even when the model emits
+// shorter fragments or sparser timestamps. Bucket boundaries are
+// minute-aligned (00:00, 01:00, 02:00, ...).
+function bucketize(segs, bucketSec) {
+  bucketSec = bucketSec || 60;
   const out = [];
-  let cur = null;
+  const buckets = new Map();
   for (const s of segs) {
-    if (cur && timeToSec(s.start) - timeToSec(cur.start) < 40) cur.text += ' ' + s.text;
-    else { cur = { start: s.start, text: s.text }; out.push(cur); }
+    const t = timeToSec(s.start);
+    if (!Number.isFinite(t)) continue;
+    const b = Math.floor(t / bucketSec);
+    let cur = buckets.get(b);
+    if (!cur) {
+      cur = { start: secToTime(b * bucketSec), text: s.text };
+      buckets.set(b, cur);
+      out.push(cur);
+    } else {
+      cur.text += ' ' + s.text;
+    }
   }
   return out;
 }
@@ -412,7 +426,7 @@ async function transcribeFlow() {
       parsed.segments = cl.segments;
       tsScaled = cl.scaled;
     }
-    parsed.segments = paragraphize(parsed.segments);
+    parsed.segments = bucketize(parsed.segments, 60);
     $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
     showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။' +
