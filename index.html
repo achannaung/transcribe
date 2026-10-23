@@ -168,7 +168,7 @@
   <header>
     <div class="logo-badge">🎙️ Burmese Audio Transcriber</div>
     <h1>မြန်မာ <span>Audio Transcription</span> စနစ်</h1>
-    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
+    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp (၅ စက္ကန့်ခြား) ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
   </header>
 
   <div class="panel">
@@ -195,6 +195,10 @@
       <div class="key-row">
         <input type="password" id="apiKey" placeholder="Paste your Google Gemini API key..." autocomplete="off">
         <button class="toggle-key" id="toggleKey" type="button" title="Show/hide">👁</button>
+      </div>
+      <label for="modelSelect" style="margin-top:12px">Model</label>
+      <div class="key-row">
+        <select id="modelSelect" style="flex:1;background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px;font-size:14px"></select>
       </div>
       <p class="hint-text">Key ကို ဤ browser ထဲမှာသာ (localStorage) သိမ်းထားပါမယ် — server မရှိပါ။
         <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio မှ API Key ရယူပါ</a>
@@ -233,7 +237,7 @@ Task: Transcribe the provided audio into accurate Burmese text with timestamps.
 
 Constraints & Rules:
 1. Accuracy: Transcribe ALL spoken words verbatim in Burmese.
-2. Timestamps: Include timestamps in [HH:MM:SS] format at the beginning of each natural segment.
+2. Timestamps: Start a new segment every 5 seconds. Include timestamps in [HH:MM:SS] format at the beginning of each segment, on exact 5-second marks ([00:00:00], [00:00:05], [00:00:10], …). Each segment contains ONLY the words spoken within that 5-second window; skip windows with no speech.
 3. Language: Output ONLY in Burmese (Myanmar language). Do not translate.
 4. Formatting: One segment per line, starting with timestamp followed by the spoken text.
 5. Complete: Do not omit any part of the audio. Include all speech.
@@ -242,12 +246,12 @@ Output Format:
 Return ONLY the timestamped transcript text, one segment per line:
 [00:00:00] First segment of spoken text
 [00:00:05] Second segment of spoken text
-[00:00:12] Third segment of spoken text
+[00:00:10] Third segment of spoken text
 
 Do NOT include any titles, headers, speaker labels, commentary, or markdown formatting.`;
 
 const PROVIDERS = {
-  gemini:     { label: 'Google Gemini',   models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.6-pro', 'gemini-2.5-flash'] }
+  gemini:     { label: 'Google Gemini',   models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.6-pro'] }
 };
 
 const $ = id => document.getElementById(id);
@@ -265,6 +269,7 @@ function init() {
   dz.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
 
   $('apiKey').addEventListener('change', saveSettings);
+  initModelSelect();
   $('toggleKey').addEventListener('click', () => {
     const k = $('apiKey');
     k.type = k.type === 'password' ? 'text' : 'password';
@@ -282,15 +287,30 @@ function saveSettings() {
   localStorage.setItem('dcc_key', $('apiKey').value.trim());
 }
 
+function initModelSelect() {
+  const sel = $('modelSelect');
+  if (!sel) return;
+  const opts = [['auto', 'Auto — အမြန်ဆုံး (နောက်ဆုံး အလုပ်လုပ်ခဲ့တဲ့ model အရင်)']];
+  for (const m of PROVIDERS.gemini.models) opts.push([m, m]);
+  sel.innerHTML = opts.map(([v, l]) => '<option value="' + v + '">' + l + '</option>').join('');
+  sel.value = localStorage.getItem('dcc_model') || 'auto';
+  sel.addEventListener('change', () => localStorage.setItem('dcc_model', sel.value));
+}
+
+function pinnedModel() {
+  const v = localStorage.getItem('dcc_model');
+  return v && v !== 'auto' ? v : null;
+}
+
 const AUDIO_RE = /\.(mp3|wav|m4a|aac|ogg|oga|opus|webm|flac)$/i;
-const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (a Burmese Dhamma talk) into Burmese text. Output ONLY timestamped lines, one per natural paragraph or segment, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text for that segment. Use the actual time in the audio where each segment begins, e.g. [00:00:45]. Do NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the talk.';
+const TRANSCRIBE_PROMPT = 'You are a professional transcriptionist specializing in Burmese. Transcribe this audio (a Burmese Dhamma talk) into Burmese text. Output ONLY timestamped lines, each line formatted EXACTLY as [HH:MM:SS] followed by a space and the spoken text. Start a NEW line every 5 seconds of audio: timestamps MUST fall on exact 5-second marks — [00:00:00], [00:00:05], [00:00:10], [00:00:15], and so on — and each line must contain ONLY the words spoken within that 5-second window. If nobody speaks during a 5-second window, skip that window (no empty lines). Do NOT add titles, speaker labels, notes, commentary, or markdown. Do not omit any part of the talk.';
 
 function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.test(f.name); }
 
 // Parallel chunking: audio longer than CHUNK_MIN_DUR is split into CHUNK_SEC
 // pieces (16kHz mono WAV) and transcribed concurrently, then merged.
 const CHUNK_SEC = 300;
-const CHUNK_CONCURRENCY = 3;
+const CHUNK_CONCURRENCY = 5;
 const CHUNK_MIN_DUR = 360;
 const CHUNK_MAX_DUR = 3600;
 
@@ -300,7 +320,7 @@ function buildPrompt(durationSec) {
   let p = TRANSCRIBE_PROMPT;
   if (durationSec && durationSec > 0) {
     const total = secToTime(Math.round(durationSec));
-    p += "\n\nCRITICAL: The audio is exactly " + total + " long. Every timestamp MUST be between [00:00:00] and [" + total + "]. The final segment must start before " + total + ". Never invent timestamps beyond the audio length.";
+    p += "\n\nCRITICAL: The audio is exactly " + total + " long. Every timestamp MUST be between [00:00:00] and [" + total + "]. The final segment must start before " + total + ". Never invent timestamps beyond the audio length. Every timestamp must be an exact multiple of 5 seconds.";
   }
   return p;
 }
@@ -376,14 +396,64 @@ function getAudioDuration(file) {
   });
 }
 
-function paragraphize(segs) {
-  const out = [];
-  let cur = null;
-  for (const s of segs) {
-    if (cur && timeToSec(s.start) - timeToSec(cur.start) < 40) cur.text += ' ' + s.text;
-    else { cur = { start: s.start, text: s.text }; out.push(cur); }
+// Output grid: one transcript line per 5-second window.
+const SEG_SECONDS = 5;
+
+// Re-cut the model's segments onto an exact 5-second grid. Segments that
+// already sit inside one window are kept whole; a segment spanning
+// several windows has its text distributed across them in proportion to
+// its length, so every output line starts on a 5-second mark.
+function bucketize5s(segs, durationSec) {
+  const items = segs
+    .map(s => ({ t: timeToSec(s.start), text: (s.text || '').trim() }))
+    .filter(s => Number.isFinite(s.t) && s.text)
+    .sort((a, b) => a.t - b.t);
+  if (!items.length) return segs;
+  const buckets = new Map();
+  const put = (t, text) => {
+    const b = Math.max(0, Math.floor(t / SEG_SECONDS) * SEG_SECONDS);
+    buckets.set(b, buckets.has(b) ? buckets.get(b) + ' ' + text : text);
+  };
+  for (let i = 0; i < items.length; i++) {
+    const start = items[i].t;
+    let end;
+    if (i + 1 < items.length) end = items[i + 1].t;
+    else if (durationSec && durationSec > start) end = durationSec;
+    else end = start + SEG_SECONDS;
+    if (end <= start) end = start + SEG_SECONDS;
+    const span = end - start;
+    // Distribute only as far as the text plausibly reaches — a short
+    // phrase followed by silence stays whole in its first window.
+    const nParts = Math.min(24, Math.ceil(span / SEG_SECONDS), Math.max(1, Math.floor(items[i].text.length / 10)));
+    if (nParts <= 1) { put(start, items[i].text); continue; }
+    const parts = splitTextProportionally(items[i].text, nParts);
+    for (let k = 0; k < parts.length; k++) if (parts[k]) put(start + k * SEG_SECONDS, parts[k]);
   }
-  return out;
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([t, text]) => ({ start: secToTime(t), text }));
+}
+
+// Split text into n roughly equal parts by character count, preferring
+// to cut at a space near each ideal boundary.
+function splitTextProportionally(text, n) {
+  if (n <= 1 || text.length < 2) return [text];
+  const parts = [];
+  let rest = text;
+  for (let k = n - 1; k >= 1; k--) {
+    const target = Math.round(rest.length / (k + 1));
+    let cut = -1;
+    const lo = Math.max(1, target - 15), hi = Math.min(rest.length - 1, target + 15);
+    for (let j = lo; j <= hi; j++) {
+      if (rest[j] === ' ' && (cut < 0 || Math.abs(j - target) < Math.abs(cut - target))) cut = j;
+    }
+    if (cut < 0) cut = target;
+    parts.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+    if (!rest) break;
+  }
+  if (rest) parts.push(rest);
+  return parts;
 }
 
 async function transcribeFlow() {
@@ -412,7 +482,7 @@ async function transcribeFlow() {
       parsed.segments = cl.segments;
       tsScaled = cl.scaled;
     }
-    parsed.segments = paragraphize(parsed.segments);
+    parsed.segments = bucketize5s(parsed.segments, currentDuration);
     $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
     showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။' +
@@ -438,53 +508,86 @@ function modelVersionRank(n) {
   return m ? parseInt(m[1], 10) * 100 + parseInt(m[2], 10) : 0;
 }
 
+let discoveryPromise = null;
+
 // Ask the API which models actually exist for this key (cached 1h),
-// so retired model names don't break the app.
+// so retired model names don't break the app. Concurrent callers share
+// one in-flight request, and a slow models endpoint never blocks
+// transcription for more than 8 seconds.
 async function discoverModels(key) {
   const now = Date.now();
   if (discoveredModels && now - discoveredAt < 3600000) return discoveredModels;
-  try {
-    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?key=' + encodeURIComponent(key) + '&pageSize=100');
-    if (!r.ok) return null;
-    const j = await r.json();
-    const ms = (j.models || [])
-      .map(m => String(m.name || '').replace(/^models\//, ''))
-      .filter(n => /flash/i.test(n) && !/tts|image|embed|aqa/i.test(n));
-    ms.sort((a, b) => modelVersionRank(b) - modelVersionRank(a));
-    if (ms.length) { discoveredModels = ms; discoveredAt = now; return ms; }
-  } catch (e) { console.error('model discovery failed:', e); }
-  return null;
+  if (discoveryPromise) return discoveryPromise;
+  discoveryPromise = (async () => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      let r;
+      try {
+        r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?key=' + encodeURIComponent(key) + '&pageSize=100', { signal: ctrl.signal });
+      } finally { clearTimeout(t); }
+      if (!r.ok) return null;
+      const j = await r.json();
+      const ms = (j.models || [])
+        .map(m => String(m.name || '').replace(/^models\//, ''))
+        .filter(n => /flash/i.test(n) && !/tts|image|embed|aqa/i.test(n));
+      // Full flash models first (better Burmese accuracy); -lite variants
+      // are faster but weaker, so they stay as later fallbacks.
+      ms.sort((a, b) => ((/lite/i.test(a) ? 1 : 0) - (/lite/i.test(b) ? 1 : 0)) || (modelVersionRank(b) - modelVersionRank(a)));
+      if (ms.length) { discoveredModels = ms; discoveredAt = Date.now(); return ms; }
+    } catch (e) { console.error('model discovery failed:', e); }
+    return null;
+  })();
+  try { return await discoveryPromise; } finally { discoveryPromise = null; }
+}
+
+async function requestModel(model, parts, key, signal, thinkingOff) {
+  const generationConfig = { temperature: 0, maxOutputTokens: 65535 };
+  // Transcription needs no reasoning — thinking off is noticeably faster.
+  if (thinkingOff) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig,
+      // Transcription of the user's own audio: don't let safety filters
+      // false-block religious speech (Dhamma talks).
+      safetySettings: [
+        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
+      ] }),
+    signal
+  });
+  const j = await handleHttp(r);
+  const cand = j.candidates && j.candidates[0];
+  if (!cand || !cand.content) {
+    const reason = (j.promptFeedback && j.promptFeedback.blockReason) || (cand && cand.finishReason) || 'unknown';
+    throw Object.assign(new Error('Gemini returned no content (reason: ' + reason + ').'), { payload: j, noContent: true });
+  }
+  return cand.content.parts.map(p => p.text || '').join('');
 }
 
 async function generateTranscript(parts, key) {
   const discovered = await discoverModels(key);
-  const models = [...new Set([...(discovered || []), ...PROVIDERS.gemini.models])];
+  // Try first: the model the user pinned, then the last model that
+  // worked on this key, then discovered models, then built-in fallbacks.
+  const models = [...new Set([pinnedModel(), localStorage.getItem('dcc_last_model'), ...(discovered || []), ...PROVIDERS.gemini.models].filter(Boolean))];
   let lastErr = null;
   for (const model of models) {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 600000);
+    const t = setTimeout(() => ctrl.abort(), 240000);
     try {
-      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(key), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0, maxOutputTokens: 65535 },
-          // Transcription of the user's own audio: don't let safety filters
-          // false-block religious speech (Dhamma talks).
-          safetySettings: [
-            { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-            { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-          ] }),
-        signal: ctrl.signal
-      });
-      const j = await handleHttp(r);
-      const cand = j.candidates && j.candidates[0];
-      if (!cand || !cand.content) {
-        const reason = (j.promptFeedback && j.promptFeedback.blockReason) || (cand && cand.finishReason) || 'unknown';
-        throw Object.assign(new Error('Gemini returned no content (reason: ' + reason + ').'), { payload: j, noContent: true });
+      let text;
+      try {
+        text = await requestModel(model, parts, key, ctrl.signal, true);
+      } catch (e) {
+        // A model that rejects the thinking setting gets one retry without it.
+        if (/API error 400/.test(e.message || '')) text = await requestModel(model, parts, key, ctrl.signal, false);
+        else throw e;
       }
-      return cand.content.parts.map(p => p.text || '').join('');
+      localStorage.setItem('dcc_last_model', model);
+      return text;
     } catch (err) {
       lastErr = err;
       const m = /API error (\d+)/.exec(err.message || '');
@@ -503,7 +606,7 @@ async function generateTranscript(parts, key) {
 }
 
 async function transcribeGemini(file, key) {
-  const model = PROVIDERS.gemini.models[0];
+  const model = pinnedModel() || localStorage.getItem('dcc_last_model') || 'Auto';
   const mime = file.type || 'audio/mpeg';
   let uri = null, name = null;
   if (file.size > 14 * 1024 * 1024) {
