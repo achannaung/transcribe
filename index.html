@@ -310,7 +310,7 @@ function isAudio(f) { return (f.type || '').startsWith('audio/') || AUDIO_RE.tes
 // Parallel chunking: audio longer than CHUNK_MIN_DUR is split into CHUNK_SEC
 // pieces (16kHz mono WAV) and transcribed concurrently, then merged.
 const CHUNK_SEC = 300;
-const CHUNK_CONCURRENCY = 5;
+const CHUNK_CONCURRENCY = 3;
 const CHUNK_MIN_DUR = 360;
 const CHUNK_MAX_DUR = 3600;
 
@@ -502,6 +502,12 @@ async function transcribeFlow() {
 
 let discoveredModels = null;
 let discoveredAt = 0;
+// Session model health: a model that fails once (404 / no content / 5xx /
+// timeout) is skipped by every later call this session, and the first
+// model that succeeds is tried first everywhere — no endless parade of
+// every chunk re-trying the same dead models.
+const sessionBadModels = new Set();
+let sessionGoodModel = null;
 
 function modelVersionRank(n) {
   const m = /(\d+)\.(\d+)/.exec(n);
@@ -570,9 +576,14 @@ async function requestModel(model, parts, key, signal, thinkingOff) {
 
 async function generateTranscript(parts, key) {
   const discovered = await discoverModels(key);
-  // Try first: the model the user pinned, then the last model that
-  // worked on this key, then discovered models, then built-in fallbacks.
-  const models = [...new Set([pinnedModel(), localStorage.getItem('dcc_last_model'), ...(discovered || []), ...PROVIDERS.gemini.models].filter(Boolean))];
+  // Try first: the model the user pinned, then models known to work
+  // (this session, then remembered), then discovered models, then
+  // built-in fallbacks. Session-dead models are skipped and at most 4
+  // models are attempted per call, so a bad day on one project can
+  // never turn into an endless model parade.
+  const ordered = [...new Set([pinnedModel(), sessionGoodModel, localStorage.getItem('dcc_last_model'), ...(discovered || []), ...PROVIDERS.gemini.models].filter(Boolean))];
+  let models = ordered.filter(m => !sessionBadModels.has(m)).slice(0, 4);
+  if (!models.length) models = ordered.slice(0, 1);
   let lastErr = null;
   for (const model of models) {
     const ctrl = new AbortController();
@@ -586,6 +597,7 @@ async function generateTranscript(parts, key) {
         if (/API error 400/.test(e.message || '')) text = await requestModel(model, parts, key, ctrl.signal, false);
         else throw e;
       }
+      sessionGoodModel = model;
       localStorage.setItem('dcc_last_model', model);
       return text;
     } catch (err) {
@@ -594,7 +606,11 @@ async function generateTranscript(parts, key) {
       const status = m ? parseInt(m[1], 10) : 0;
       console.error('Transcribe model failed:', model, err.message);
       if (err.name === 'AbortError' || err.noContent || status === 404 || status === 429 || status >= 500) {
+        // 429 = rate limit (temporary — cool down, don't blacklist);
+        // anything else marks the model dead for this session.
+        if (status !== 429) sessionBadModels.add(model);
         showInfo('⚠️ <b>' + model + '</b> အဆင်မပြေလို့ နောက် model နဲ့ ထပ်စမ်းနေသည်…');
+        if (status === 429) await new Promise(r => setTimeout(r, 8000));
         continue;
       }
       throw err;
