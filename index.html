@@ -251,7 +251,7 @@ Return ONLY the timestamped transcript text, one segment per line:
 Do NOT include any titles, headers, speaker labels, commentary, or markdown formatting.`;
 
 const PROVIDERS = {
-  gemini:     { label: 'Google Gemini',   models: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.6-pro'] }
+  gemini:     { label: 'Google Gemini',   models: ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.6-pro'] }
 };
 
 const $ = id => document.getElementById(id);
@@ -536,10 +536,12 @@ async function discoverModels(key) {
       const j = await r.json();
       const ms = (j.models || [])
         .map(m => String(m.name || '').replace(/^models\//, ''))
-        .filter(n => /flash/i.test(n) && !/tts|image|embed|aqa/i.test(n));
+        .filter(n => /flash|hydrogen/i.test(n) && !/tts|image|embed|aqa/i.test(n));
       // Full flash models first (better Burmese accuracy); -lite variants
       // are faster but weaker, so they stay as later fallbacks.
-      ms.sort((a, b) => ((/lite/i.test(a) ? 1 : 0) - (/lite/i.test(b) ? 1 : 0)) || (modelVersionRank(b) - modelVersionRank(a)));
+      // Gemini 4 Hydrogen (the current fast flagship) ranks above all flash
+      // models; it has no "flash" in its name, so it needs the explicit pass.
+      ms.sort((a, b) => ((/hydrogen/i.test(b) ? 1 : 0) - (/hydrogen/i.test(a) ? 1 : 0)) || ((/lite/i.test(a) ? 1 : 0) - (/lite/i.test(b) ? 1 : 0)) || (modelVersionRank(b) - modelVersionRank(a)));
       if (ms.length) { discoveredModels = ms; discoveredAt = Date.now(); return ms; }
     } catch (e) { console.error('model discovery failed:', e); }
     return null;
