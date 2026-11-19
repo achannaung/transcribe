@@ -545,7 +545,10 @@ async function discoverModels(key) {
       const j = await r.json();
       const ms = (j.models || [])
         .map(m => String(m.name || '').replace(/^models\//, ''))
-        .filter(n => /flash|hydrogen/i.test(n) && !/tts|image|embed|aqa/i.test(n));
+        // Live API models (…-live-preview) only accept WebSocket
+        // bidiGenerateContent — they 400 on generateContent, so they
+        // must never enter the transcription model list.
+        .filter(n => /flash|hydrogen/i.test(n) && !/tts|image|embed|aqa|live/i.test(n));
       // Full flash models first (better Burmese accuracy); -lite variants
       // are faster but weaker, so they stay as later fallbacks.
       // Gemini 4 Hydrogen (the current fast flagship) ranks above all flash
@@ -620,7 +623,10 @@ async function generateTranscript(parts, key) {
         const m = /API error (\d+)/.exec(err.message || '');
         const status = m ? parseInt(m[1], 10) : 0;
         console.error('Transcribe model failed:', model, err.message);
-        const retryable = err.name === 'AbortError' || err.noContent || status === 404 || status === 429 || status >= 500;
+        // A 400 that survives the no-thinking retry is model-specific
+        // (e.g. a model that rejects generateContent outright) — treat
+        // it like a dead model and move on, never abort the whole run.
+        const retryable = err.name === 'AbortError' || err.noContent || status === 400 || status === 404 || status === 429 || status >= 500;
         if (!retryable) throw err;
         if (status === 503 && attempt === 0) {
           showInfo('⚠️ <b>' + model + '</b> — Google server အလုပ်များနေသည် (503)။ ၆ စက္ကန့် စောင့်၍ ဒီ model နဲ့ပဲ ပြန်စမ်းနေသည်…');
