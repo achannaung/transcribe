@@ -593,41 +593,53 @@ async function generateTranscript(parts, key) {
   // models are attempted per call, so a bad day on one project can
   // never turn into an endless model parade.
   const ordered = [...new Set([pinnedModel(), sessionGoodModel, localStorage.getItem('dcc_last_model'), ...(discovered || []), ...PROVIDERS.gemini.models].filter(Boolean))];
-  let models = ordered.filter(m => !sessionBadModels.has(m)).slice(0, 4);
+  let models = ordered.filter(m => !sessionBadModels.has(m)).slice(0, 5);
   if (!models.length) models = ordered.slice(0, 1);
   let lastErr = null;
   for (const model of models) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 240000);
-    try {
-      let text;
+    // A 503 (Google high demand) is usually a brief spike: wait 6s and
+    // retry the SAME model once before falling through to the next one,
+    // instead of burning the whole model list and failing slowly.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 240000);
       try {
-        text = await requestModel(model, parts, key, ctrl.signal, true);
-      } catch (e) {
-        // A model that rejects the thinking setting gets one retry without it.
-        if (/API error 400/.test(e.message || '')) text = await requestModel(model, parts, key, ctrl.signal, false);
-        else throw e;
-      }
-      sessionGoodModel = model;
-      localStorage.setItem('dcc_last_model', model);
-      return text;
-    } catch (err) {
-      lastErr = err;
-      const m = /API error (\d+)/.exec(err.message || '');
-      const status = m ? parseInt(m[1], 10) : 0;
-      console.error('Transcribe model failed:', model, err.message);
-      if (err.name === 'AbortError' || err.noContent || status === 404 || status === 429 || status >= 500) {
+        let text;
+        try {
+          text = await requestModel(model, parts, key, ctrl.signal, true);
+        } catch (e) {
+          // A model that rejects the thinking setting gets one retry without it.
+          if (/API error 400/.test(e.message || '')) text = await requestModel(model, parts, key, ctrl.signal, false);
+          else throw e;
+        }
+        sessionGoodModel = model;
+        localStorage.setItem('dcc_last_model', model);
+        return text;
+      } catch (err) {
+        lastErr = err;
+        const m = /API error (\d+)/.exec(err.message || '');
+        const status = m ? parseInt(m[1], 10) : 0;
+        console.error('Transcribe model failed:', model, err.message);
+        const retryable = err.name === 'AbortError' || err.noContent || status === 404 || status === 429 || status >= 500;
+        if (!retryable) throw err;
+        if (status === 503 && attempt === 0) {
+          showInfo('⚠️ <b>' + model + '</b> — Google server အလုပ်များနေသည် (503)။ ၆ စက္ကန့် စောင့်၍ ဒီ model နဲ့ပဲ ပြန်စမ်းနေသည်…');
+          await new Promise(r => setTimeout(r, 6000));
+          continue;
+        }
         // 429 = rate limit (temporary — cool down, don't blacklist);
         // anything else marks the model dead for this session.
         if (status !== 429) sessionBadModels.add(model);
         showInfo('⚠️ <b>' + model + '</b> အဆင်မပြေလို့ နောက် model နဲ့ ထပ်စမ်းနေသည်…');
         if (status === 429) await new Promise(r => setTimeout(r, 8000));
-        continue;
+        break;
+      } finally {
+        clearTimeout(t);
       }
-      throw err;
-    } finally {
-      clearTimeout(t);
     }
+  }
+  if (lastErr && /API error 503/.test(lastErr.message || '')) {
+    throw new Error('Google server အလုပ်များနေပါတယ် (503) — model အားလုံး အလုပ်များနေလို့ အခုချက် transcribe မရပါ။ ၅–၁၀ မိနစ်ခန့် စောင့်ပြီး ပြန်စမ်းကြည့်ပါ။');
   }
   throw lastErr || new Error('All models failed.');
 }
