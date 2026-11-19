@@ -168,7 +168,7 @@
   <header>
     <div class="logo-badge">🎙️ Burmese Audio Transcriber</div>
     <h1>မြန်မာ <span>Audio Transcription</span> စနစ်</h1>
-    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp (၅ စက္ကန့်ခြား) ပါသော Burmese transcript ကို text file အဖြစ် ပြောင်းပေးပါလိမ့်မယ်</p>
+    <p class="subtitle mm">Audio file (.mp3/.wav/.m4a/.flac) ကို upload လုပ်ပါ — AI က timestamp (၅ စက္ကန့်ခြား) ပါသော Burmese transcript နှင့် subtitle ထိုးရန် .srt file ကို ပြောင်းပေးပါလိမ့်မယ်</p>
   </header>
 
   <div class="panel">
@@ -219,9 +219,15 @@
       <div class="export-btns">
         <button class="btn btn-secondary btn-sm" id="copyTextBtn">📋 Copy Text</button>
         <button class="btn btn-primary btn-sm" id="downloadTxtBtn">⬇️ Download .txt</button>
+        <button class="btn btn-secondary btn-sm" id="copySrtBtn">📋 Copy SRT</button>
+        <button class="btn btn-primary btn-sm" id="downloadSrtBtn">⬇️ Download .srt</button>
       </div>
     </div>
     <div class="transcript-block" id="transcriptBlock" style="max-height:500px;"></div>
+    <div class="results-head" style="margin-top:24px;">
+      <h2 style="font-size:17px;">🎬 Subtitle (.srt) <span class="mm" style="font-weight:400;color:var(--text-faint);font-size:13px;">— အသံအလိုက် ဝါကျအလိုက် ဖြတ်ထားသည် · Tayar / Subtitle Studio ထဲ တိုက်ရိုက်ထည့်သုံးနိုင်သည်</span></h2>
+    </div>
+    <div class="transcript-block" id="srtBlock" style="border-left-color:var(--purple);max-height:400px;"></div>
   </div>
 
   <footer>
@@ -278,6 +284,8 @@ function init() {
   $('transcribeBtn').addEventListener('click', transcribeFlow);
   $('copyTextBtn').addEventListener('click', () => copyText($('transcriptBlock').textContent, $('copyTextBtn'), '📋 Copy Text', '✅ Copied!'));
   $('downloadTxtBtn').addEventListener('click', downloadTranscript);
+  $('copySrtBtn').addEventListener('click', () => copyText(lastSrt, $('copySrtBtn'), '📋 Copy SRT', '✅ Copied!'));
+  $('downloadSrtBtn').addEventListener('click', downloadSrt);
 
   const savedKey = localStorage.getItem('dcc_key');
   if (savedKey) $('apiKey').value = savedKey;
@@ -353,6 +361,7 @@ function loadFile(file) {
   hideBanners();
   parsed = null;
   results = null;
+  lastSrt = '';
   currentAudioFile = null;
   currentDuration = null;
   $('results').classList.remove('show');
@@ -485,7 +494,7 @@ async function transcribeFlow() {
     parsed.segments = bucketize5s(parsed.segments, currentDuration);
     $('stSegs').textContent = parsed.segments.length;
     showTranscript(parsed.segments);
-    showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ text file ရယူပါ။' +
+    showInfo('✅ Transcribe ပြီးပါပြီ — <b>' + parsed.segments.length + '</b> segments။ Download နှိပ်၍ .txt file နှင့် subtitle အတွက် .srt file ရယူပါ။' +
       (tsScaled ? '<br>⚠️ Timestamp များ audio အရှည်နှင့် ကိုက်ညီအောင် အချိုးကျ ပြင်ဆင်ပေးထားပါသည်။' : ''));
   } catch (err) {
     let msg = err.name === 'AbortError' ? '❌ Transcription timeout' : '❌ ' + err.message;
@@ -901,8 +910,129 @@ function showInfo(msg) { const b = $('infoBanner'); b.innerHTML = msg; b.style.d
 function showTranscript(segments) {
   const text = segments.map(s => `[${s.start}] ${s.text}`).join('\n');
   $('transcriptBlock').textContent = text;
+  lastSrt = buildSrt(segments, currentDuration);
+  $('srtBlock').textContent = lastSrt;
   $('results').classList.add('show');
   $('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// ---------- SRT subtitle export ----------
+// Re-cut the 5-second grid into subtitle cues that follow the audio:
+// a cue closes at a sentence end (။ ! ? …) whenever the speech does,
+// sentences spanning several grid windows stay in one cue, over-long
+// passages are split at clause marks (၊) with proportional timing, and
+// every cue carries a start AND end time so the .srt can be burned or
+// imported (Tayar, Subtitle Studio, YouTube) as-is.
+let lastSrt = '';
+
+function splitSentences(text) {
+  const out = [];
+  const re = /[^။!?…]+[။!?…]+["”’']?|[^။!?…]+$/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const t = m[0].trim();
+    if (t) out.push(t);
+  }
+  return out.length ? out : [text.trim()].filter(Boolean);
+}
+
+// Wrap a cue onto at most two lines, cutting only at a space or after a
+// clause mark (၊) so no Burmese grapheme cluster is ever broken.
+function wrapCueText(text) {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length <= 48) return t;
+  const mid = t.length / 2;
+  let cut = -1;
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === ' ' || t[i] === '၊') {
+      const c = t[i] === ' ' ? i : i + 1;
+      if (cut < 0 || Math.abs(c - mid) < Math.abs(cut - mid)) cut = c;
+    }
+  }
+  if (cut <= 0 || cut >= t.length) return t;
+  return t.slice(0, cut).trim() + '\n' + t.slice(cut).trim();
+}
+
+function buildSrtCues(segments, durationSec) {
+  const wins = segments
+    .map(s => ({ t: timeToSec(s.start), text: (s.text || '').trim() }))
+    .filter(w => Number.isFinite(w.t) && w.text)
+    .sort((a, b) => a.t - b.t);
+  if (!wins.length) return [];
+  const winEnd = i => (i + 1 < wins.length ? wins[i + 1].t : (durationSec && durationSec > wins[i].t ? durationSec : wins[i].t + SEG_SECONDS));
+  // Atoms: sentence pieces, each with its own time span. Sentences
+  // sharing one window divide that window in proportion to their
+  // length, so no two cues ever claim the same start time.
+  const atoms = [];
+  wins.forEach((w, i) => {
+    const pieces = splitSentences(w.text);
+    const total = pieces.reduce((n, p) => n + p.length, 0) || 1;
+    let t = w.t;
+    pieces.forEach((piece, j) => {
+      const e = j === pieces.length - 1 ? winEnd(i) : t + (winEnd(i) - w.t) * (piece.length / total);
+      atoms.push({ start: t, end: e, text: piece, ends: /[။!?…]$/.test(piece) });
+      t = e;
+    });
+  });
+  if (!atoms.length) return [];
+  const cues = [];
+  let cur = null;
+  const flush = () => { if (cur) { cues.push(cur); cur = null; } };
+  for (const a of atoms) {
+    if (!cur) cur = { start: a.start, end: a.end, text: a.text };
+    else { cur.text += ' ' + a.text; cur.end = a.end; }
+    if (a.ends || cur.end - cur.start >= 12 || cur.text.length >= 130) flush();
+  }
+  flush();
+  // Split over-long cues at clause boundaries with proportional timing.
+  const out = [];
+  for (const c of cues) {
+    if (c.text.length <= 120 || c.end - c.start < 4) { out.push(c); continue; }
+    const parts = splitTextProportionally(c.text.replace(/\s+/g, ' '), Math.ceil(c.text.length / 70));
+    const totalChars = parts.reduce((n, p) => n + p.length, 0) || 1;
+    let t = c.start;
+    parts.forEach((p, i) => {
+      const e = i === parts.length - 1 ? c.end : t + (c.end - c.start) * (p.length / totalChars);
+      out.push({ start: t, end: e, text: p });
+      t = e;
+    });
+  }
+  // Enforce sane durations and no overlaps.
+  for (let i = 0; i < out.length; i++) {
+    const nextStart = i + 1 < out.length ? out[i + 1].start : Infinity;
+    if (out[i].end <= out[i].start) out[i].end = out[i].start + 1;
+    if (out[i].end - out[i].start < 1.2) out[i].end = Math.min(out[i].start + 1.2, nextStart === Infinity ? out[i].start + 2 : nextStart);
+    if (out[i].end > nextStart) out[i].end = nextStart;
+    if (out[i].end <= out[i].start) out[i].end = out[i].start + 0.5;
+    out[i].text = wrapCueText(out[i].text);
+  }
+  return out;
+}
+
+function srtTime(sec) {
+  sec = Math.max(0, sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  const ms = Math.round((sec - Math.floor(sec)) * 1000);
+  const p = (n, l) => String(n).padStart(l, '0');
+  return p(h, 2) + ':' + p(m, 2) + ':' + p(s, 2) + ',' + p(ms, 3);
+}
+
+function buildSrt(segments, durationSec) {
+  const cues = buildSrtCues(segments, durationSec);
+  if (!cues.length) return '';
+  return cues.map((c, i) => (i + 1) + '\n' + srtTime(c.start) + ' --> ' + srtTime(c.end) + '\n' + c.text).join('\n\n') + '\n';
+}
+
+function downloadSrt() {
+  if (!lastSrt) return;
+  const blob = new Blob([lastSrt], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  const d = new Date();
+  const stamp = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') + '-' + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'subtitle-' + stamp + '.srt';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 function copyText(text, btn, origLabel, okLabel) {
